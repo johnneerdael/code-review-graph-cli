@@ -1,6 +1,22 @@
 # Features
 
-## v2.3.5 (Current)
+## v2.3.8 (Current)
+- **Almost every MCP tool response is bounded**: #849 found `get_affected_flows` returning ~247k tokens inside a workflow documented as "5 tool calls, 800 tokens total"; a sweep of the other 29 tools found the same class of bug in ten more places — `list_communities` returned 206k tokens with *default* arguments, `get_community` 134k, `get_architecture_overview` 625k in standard mode. All are now capped with a uniform contract: `total` (or a per-list `*_total`) always reports the untruncated count, `truncated` marks the cut, and the summary says how many of how many are shown. Cap parameters reject values below 1 and reject booleans. `detail_level="minimal"` was added to the analysis and refactor tools. `tests/test_token_budget.py` pins the per-tool budget table and the hard ceilings so a removed cap fails CI. Four query tools — `get_impact_radius`, `find_large_functions`, `traverse_graph` and `semantic_search_nodes` — are still unbounded and tracked in #888. See [COMMANDS.md](COMMANDS.md#result-bounds).
+- **Framework-aware PHP parsing**: traits, enums, object creation, and base clauses are indexed; Composer PSR-4 resolution is longest-prefix, multi-directory, cached, and repository-bounded; Blade references ignore comments/escaped directives; Laravel Route and Eloquent edges require explicit framework/import/receiver evidence.
+- **Custom languages without forking**: drop a `.code-review-graph/languages.toml` into your repo to index any grammar shipped by tree-sitter-language-pack — extension map plus node-type lists, validated and capped, with built-in languages always winning. See [CUSTOM_LANGUAGES.md](CUSTOM_LANGUAGES.md).
+- **GitHub Action for risk-scored PR reviews**: composite `action.yml` builds/restores the graph from CI cache, runs `detect-changes` against the PR base, and upserts a sticky comment with risk table, affected flows, test gaps, and the Token Savings line. Optional `fail-on-risk` merge gate. Dogfooded on this repo via `.github/workflows/pr-review.yml`. See [GITHUB_ACTION.md](GITHUB_ACTION.md).
+- **`agent_baseline` eval benchmark**: compares graph queries against a realistic grep-and-read-top-k agent baseline instead of the whole-corpus strawman; wired into all six pinned eval configs.
+- **Co-change ground truth for `impact_accuracy`**: predictions are also graded against files actually co-changed in the same commit; the legacy metric is explicitly labelled "graph-derived (circular — upper bound)".
+- **Weekly eval CI**: `.github/workflows/eval.yml` runs a report-only cron of the two smallest pinned configs with CSV artifacts and a job summary.
+- **docs/FAQ.md**: how CRG compares to LSP, RAG, grep/agentic search, and adjacent tools; when NOT to use it; verification steps; monorepo/worktree and registry guidance.
+- **Contribution scaffolding**: GitHub issue forms (bug/feature/platform), a PR template mirroring the CONTRIBUTING checklist, and dependabot config for pip + GitHub Actions.
+- **Windows fixes**: `daemon status` no longer crashes with WinError 87 (#511), and CLI `detect-changes` maps diff paths to absolute native paths so it no longer reports 0 functions (#528).
+- **Provider-name validation**: unknown embedding provider names raise a clear error listing valid providers instead of silently falling back to the local model.
+- **Store-leak fixes**: the five analysis MCP tools and the wiki-page tool no longer leak SQLite connections (try/finally `store.close()`).
+- **`fastmcp<4` cap**: the next fastmcp major can no longer silently break the server.
+- **Worktree-safe git hooks**: `install` resolves the real hooks directory via `git rev-parse --git-path hooks`, so linked worktrees and `core.hooksPath` (husky) setups get a working pre-commit hook.
+
+## v2.3.5
 - **Token Savings panel on every brief CLI call**: `code-review-graph detect-changes --brief` and the new `code-review-graph update --brief` print a boxed `Token Savings` panel — full-context baseline, graph response, saved tokens, percent, and per-category breakdown (Functions / Tests / Risk / Other) that sums exactly to the graph response size.
 - **`--verify` flag**: cross-checks the displayed numbers against OpenAI's `cl100k_base` tokenizer (the GPT-4 family). Adds a second `Verified (tiktoken)` row showing real token counts. Calibration across 222 mixed-language files shows the estimate is within ~1% of real tokens in aggregate.
 - **`update --brief`**: incremental update + the same risk panel in one command. Distinct from `detect-changes --brief` (which is read-only against the existing graph) — use update when the graph might be stale (post-rebase, large change set).
@@ -22,7 +38,7 @@
 - **Graph lookup correctness**: Review, impact, and file-summary tools resolve user-facing paths to stored graph paths; `callers_of` includes cross-file callers even when same-file callers exist.
 - **Install/runtime reliability**: Generated Codex/Claude hooks drain stdin, bundled docs are available from wheels, missing local embeddings report unavailable status, and `.svn` roots pass validation.
 - **CLI reliability**: `build --skip-postprocess` and `update --skip-flows` honor the requested post-processing level.
-- **Broad parser surface**: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files.
+- **Broad parser surface**: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are recognized as file nodes), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files. Generic YAML is not treated as source code.
 - **Local-first by design**: SQLite graph storage remains local, with no telemetry and no cloud-default behavior.
 
 ## v2.0.0

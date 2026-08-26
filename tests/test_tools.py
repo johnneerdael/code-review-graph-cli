@@ -1,14 +1,22 @@
 """Tests for MCP tool functions."""
 
+import os
 import tempfile
+import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+import code_review_graph.tools._common as common_module
+import code_review_graph.tools.analysis_tools as analysis_module
 import code_review_graph.tools.docs as docs_module
+import code_review_graph.tools.query as query_module
 from code_review_graph.graph import GraphStore, _sanitize_name, node_to_dict
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.tools import (
+    _validate_repo_root,
     get_affected_flows_func,
     get_architecture_overview_func,
     get_community_func,
@@ -18,14 +26,15 @@ from code_review_graph.tools import (
     get_review_context,
     list_communities_func,
     list_flows,
+    list_graph_stats,
     query_graph,
-    _validate_repo_root,
 )
 
 
 class TestTools:
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         self._seed_data()
 
@@ -143,6 +152,26 @@ class TestTools:
         names = {r.name for r in results}
         assert "login" in names or "AuthService" in names
 
+    def test_search_mode_fts(self, monkeypatch, tmp_path):
+        """semantic_search_nodes reports search_mode='fts' when only FTS contributes."""
+        import code_review_graph.tools.query as query_mod
+        from code_review_graph.search import rebuild_fts_index
+        from code_review_graph.tools.query import semantic_search_nodes
+
+        tmp_db = tmp_path / "test.db"
+        store = GraphStore(tmp_db)
+        store.upsert_node(NodeInfo(
+            kind="Function", name="login", file_path="/repo/auth.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        store.commit()
+        rebuild_fts_index(store)
+
+        monkeypatch.setattr(query_mod, "_get_store", lambda repo_root=None: (store, tmp_path))
+        result = semantic_search_nodes("login")
+        assert result["status"] == "ok"
+        assert result["search_mode"] == "fts"
+
     def test_search_edges_by_target_name(self):
         """Search for edges by unqualified target name."""
         # Add an edge with bare target name
@@ -155,6 +184,57 @@ class TestTools:
         assert len(edges) == 1
         assert edges[0].source_qualified == "/repo/main.py::process"
 
+    def test_search_edges_by_target_name_uses_javascript_language_family(self):
+        """JS-family filtering keeps JS/JSX/TS/TSX/Astro callers, not Apex."""
+        callers = (
+            ("/repo/caller.js", "javascript"),
+            ("/repo/caller.jsx", "javascript"),
+            ("/repo/caller.ts", "typescript"),
+            ("/repo/caller.tsx", "tsx"),
+            ("/repo/caller.astro", "typescript"),
+            ("/repo/Caller.cls", "apex"),
+        )
+        for file_path, language in callers:
+            source = f"{file_path}::invoke"
+            self.store.upsert_node(NodeInfo(
+                kind="Function",
+                name="invoke",
+                file_path=file_path,
+                line_start=1,
+                line_end=3,
+                language=language,
+            ))
+            self.store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=source,
+                target="sharedHelper",
+                file_path=file_path,
+                line=2,
+            ))
+        self.store.commit()
+
+        expected_sources = {
+            "/repo/caller.js::invoke",
+            "/repo/caller.jsx::invoke",
+            "/repo/caller.ts::invoke",
+            "/repo/caller.tsx::invoke",
+            "/repo/caller.astro::invoke",
+        }
+        for target_language in ("javascript", "typescript", "tsx"):
+            edges = self.store.search_edges_by_target_name(
+                "sharedHelper",
+                language=target_language,
+            )
+            assert {edge.source_qualified for edge in edges} == expected_sources
+
+        apex_edges = self.store.search_edges_by_target_name(
+            "sharedHelper",
+            language="apex",
+        )
+        assert {edge.source_qualified for edge in apex_edges} == {
+            "/repo/Caller.cls::invoke",
+        }
+
 
 class TestQueryGraphCallTargetFallbacks:
     """Regression tests for mixed qualified and bare CALLS targets."""
@@ -165,9 +245,9 @@ class TestQueryGraphCallTargetFallbacks:
         (self.root / ".git").mkdir()
         (self.root / ".code-review-graph").mkdir()
 
-        self.target_file = str(self.root / "target.m")
-        self.cross_file = str(self.root / "cross.m")
-        self.dispatch_file = str(self.root / "dispatch.m")
+        self.target_file = (self.root / "target.m").as_posix()
+        self.cross_file = (self.root / "cross.m").as_posix()
+        self.dispatch_file = (self.root / "dispatch.m").as_posix()
         self.db_path = str(self.root / ".code-review-graph" / "graph.db")
         self._seed_data()
 
@@ -240,9 +320,53 @@ class TestQueryGraphCallTargetFallbacks:
         names = {r["name"] for r in result["results"]}
         assert names == {"same_file_caller", "cross_file_caller"}
         assert len(result["results"]) == 2
+        by_name = {r["name"]: r for r in result["results"]}
+        assert "target_resolution" not in by_name["same_file_caller"]
+        assert by_name["cross_file_caller"]["target_resolution"] == "unresolved"
 
         edge_targets = {e["target"] for e in result["edges"]}
         assert edge_targets == {f"{self.target_file}::target_func", "target_func"}
+
+    def test_references_to_returns_type_dependents(self, monkeypatch):
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        type_path = self.root / "types.ts"
+        use_path = self.root / "use.ts"
+        alias_path = self.root / "alias.ts"
+        type_path.write_text(
+            "export interface Finding { id: string }\n",
+            encoding="utf-8",
+        )
+        use_path.write_text(
+            "import type { Finding } from './types';\n"
+            "export function summarize(item: Finding): string { return item.id; }\n",
+            encoding="utf-8",
+        )
+        alias_path.write_text(
+            "import type { Finding as ImportedFinding } from './types';\n"
+            "export function summarizeAlias(item: ImportedFinding): string {\n"
+            "  return item.id;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with GraphStore(self.db_path) as store:
+            build = full_build(self.root, store)
+            assert build["errors"] == []
+
+        type_qn = f"{type_path.as_posix()}::Finding"
+        direct_qn = f"{use_path.as_posix()}::summarize"
+        alias_qn = f"{alias_path.as_posix()}::summarizeAlias"
+        result = query_graph(
+            pattern="references_to",
+            target=type_qn,
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert {node["qualified_name"] for node in result["results"]} == {
+            direct_qn,
+            alias_qn,
+        }
+        assert {edge["kind"] for edge in result["edges"]} == {"REFERENCES"}
 
     def test_callees_of_includes_resolved_and_bare_target_callees(self):
         result = query_graph(
@@ -260,6 +384,141 @@ class TestQueryGraphCallTargetFallbacks:
             f"{self.dispatch_file}::resolved_helper",
             "external_helper",
         }
+
+    def test_callers_of_bare_fallback_uses_js_family_without_crossing_to_apex(self):
+        """Regression for #708: JS-family callers match, unrelated Apex does not."""
+        js_file = (self.root / "clone.js").as_posix()
+        tsx_file = (self.root / "caller.tsx").as_posix()
+        apex_file = (self.root / "Clone.cls").as_posix()
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="clone", file_path=js_file,
+                line_start=1, line_end=3, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="tsxCaller", file_path=tsx_file,
+                line_start=1, line_end=5, language="tsx",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="apexCaller", file_path=apex_file,
+                line_start=1, line_end=5, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{tsx_file}::tsxCaller",
+                target="clone",
+                file_path=tsx_file,
+                line=3,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"{apex_file}::apexCaller",
+                target="clone",
+                file_path=apex_file,
+                line=3,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="callers_of",
+            target=f"{js_file}::clone",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        names = {r["name"] for r in result["results"]}
+        assert "tsxCaller" in names
+        assert "apexCaller" not in names
+
+    def test_inheritors_of_bare_fallback_uses_js_family_without_apex(self):
+        """Bare INHERITS/IMPLEMENTS edges stay inside the JS language family."""
+        base_file = (self.root / "base.js").as_posix()
+        ts_file = (self.root / "child.ts").as_posix()
+        jsx_file = (self.root / "implementer.jsx").as_posix()
+        apex_file = (self.root / "Child.cls").as_posix()
+        with GraphStore(self.db_path) as store:
+            store.upsert_node(NodeInfo(
+                kind="Class", name="BaseWidget", file_path=base_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="TsChild", file_path=ts_file,
+                line_start=1, line_end=8, language="typescript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="JsxImplementer", file_path=jsx_file,
+                line_start=1, line_end=8, language="javascript",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Class", name="ApexChild", file_path=apex_file,
+                line_start=1, line_end=8, language="apex",
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{ts_file}::TsChild",
+                target="BaseWidget",
+                file_path=ts_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="IMPLEMENTS",
+                source=f"{jsx_file}::JsxImplementer",
+                target="BaseWidget",
+                file_path=jsx_file,
+                line=1,
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="INHERITS",
+                source=f"{apex_file}::ApexChild",
+                target="BaseWidget",
+                file_path=apex_file,
+                line=1,
+            ))
+            store.commit()
+
+        result = query_graph(
+            pattern="inheritors_of",
+            target=f"{base_file}::BaseWidget",
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert {item["name"] for item in result["results"]} == {
+            "TsChild",
+            "JsxImplementer",
+        }
+
+    def test_inheritors_of_bare_dart_class_ignores_member_matches(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Issue #87: Animal.speak must not make bare Animal ambiguous."""
+        source = tmp_path / "animals.dart"
+        source.write_text(
+            "class Animal {\n"
+            "  void speak() {}\n"
+            "}\n"
+            "class Dog extends Animal {\n"
+            "  @override\n"
+            "  void speak() {}\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        with GraphStore(graph_dir / "graph.db") as store:
+            full_build(tmp_path, store)
+
+        result = query_graph(
+            pattern="inheritors_of",
+            target="Animal",
+            repo_root=str(tmp_path),
+        )
+
+        assert result["status"] == "ok"
+        assert {item["name"] for item in result["results"]} == {"Dog"}
 
 
 def _seed_repo_relative_graph(root: Path) -> None:
@@ -366,6 +625,152 @@ class TestRepoRootValidation:
             _validate_repo_root(tmp_path)
 
 
+class TestQueryGraphTestsFor:
+    """Regression tests for #515: query_graph(pattern='tests_for')
+    must follow direct TESTED_BY edges (source=production, target=test)
+    rather than relying on the naming-convention fallback.
+    """
+
+    def setup_method(self):
+        import tempfile as _tempfile
+        self._tmpdir = _tempfile.TemporaryDirectory()
+        self.repo_root = Path(self._tmpdir.name)
+        # _validate_repo_root requires .git or .code-review-graph.
+        (self.repo_root / ".code-review-graph").mkdir()
+        # find_project_root / get_db_path look here for the DB.
+        from code_review_graph.incremental import get_db_path
+        self.db_path = get_db_path(self.repo_root)
+        self.store = GraphStore(str(self.db_path))
+        self._seed_graph()
+
+    def teardown_method(self):
+        self.store.close()
+        self._tmpdir.cleanup()
+
+    def _seed_graph(self):
+        # Production function with an unconventional name so the
+        # naming-convention fallback (test_<name> / Test<name>) cannot match.
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="/src/calc.py", file_path="/src/calc.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="combine", file_path="/src/calc.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="orchestrate", file_path="/src/calc.py",
+            line_start=7, line_end=12, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="/tests/spec.py", file_path="/tests/spec.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Test", name="verify_\x01combine_behaviour",
+            file_path="/tests/spec.py",
+            line_start=1, line_end=5, language="python", is_test=True,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Test", name="test_combine",
+            file_path="/tests/spec.py",
+            line_start=7, line_end=10, language="python", is_test=True,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="shared_name", file_path="/src/first.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="shared_name", file_path="/src/second.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        # Parser-canonical direction: source=production, target=test.
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY",
+            source="/src/calc.py::combine",
+            target="/tests/spec.py::verify_\x01combine_behaviour",
+            file_path="/tests/spec.py", line=1,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source="/src/calc.py::orchestrate",
+            target="/src/calc.py::combine",
+            file_path="/src/calc.py", line=9,
+        ))
+        self.store.commit()
+        # Release the writer connection so query_graph can open its own.
+        self.store.close()
+
+    def test_query_graph_tests_for_finds_direct_edge(self):
+        from code_review_graph.tools import query_graph
+        result = query_graph(
+            pattern="tests_for",
+            target="/src/calc.py::combine",
+            repo_root=str(self.repo_root),
+        )
+        assert result["status"] == "ok"
+        match = next(
+            r for r in result["results"]
+            if r["qualified_name"] == "/tests/spec.py::verify_combine_behaviour"
+        )
+        assert match["name"] == "verify_combine_behaviour"
+        assert match["indirect"] is False
+        assert set(match) == {
+            "id", "kind", "name", "qualified_name", "file_path",
+            "line_start", "line_end", "language", "parent_name", "is_test",
+            "indirect",
+        }
+
+    def test_query_graph_marks_naming_only_test_as_inferred(self):
+        from code_review_graph.tools import query_graph
+
+        result = query_graph(
+            pattern="tests_for",
+            target="/src/calc.py::combine",
+            repo_root=str(self.repo_root),
+        )
+
+        match = next(r for r in result["results"] if r["name"] == "test_combine")
+        assert match["inferred_by"] == "naming_convention"
+
+    def test_query_graph_tests_for_finds_one_hop_indirect_test(self):
+        from code_review_graph.tools import query_graph
+
+        result = query_graph(
+            pattern="tests_for",
+            target="/src/calc.py::orchestrate",
+            repo_root=str(self.repo_root),
+        )
+
+        assert result["status"] == "ok"
+        match = next(
+            r for r in result["results"]
+            if r["qualified_name"] == "/tests/spec.py::verify_combine_behaviour"
+        )
+        assert match["indirect"] is True
+        assert match["is_test"] is True
+
+        minimal = query_graph(
+            pattern="tests_for",
+            target="/src/calc.py::orchestrate",
+            repo_root=str(self.repo_root),
+            detail_level="minimal",
+        )
+        assert minimal["results"][0]["indirect"] is True
+
+    def test_query_graph_tests_for_keeps_ambiguous_target_explicit(self):
+        from code_review_graph.tools import query_graph
+
+        result = query_graph(
+            pattern="tests_for",
+            target="shared_name",
+            repo_root=str(self.repo_root),
+        )
+
+        assert result["status"] == "ambiguous"
+        assert len(result["candidates"]) == 2
+
+
 class TestGetDocsSection:
     """Tests for the get_docs_section tool."""
 
@@ -436,11 +841,125 @@ class TestGetDocsSection:
         assert result["content"] == "packaged docs"
 
 
+class TestEmbedGraphProviderErrors:
+    """embed_graph must surface provider errors as structured responses,
+    never as a traceback, and must always close its GraphStore."""
+
+    def test_unknown_provider_returns_structured_error(self, tmp_path):
+        (tmp_path / ".code-review-graph").mkdir()
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="moonbase",
+        )
+        assert result["status"] == "error"
+        assert "Unknown embedding provider" in result["error"]
+        assert "moonbase" in result["error"]
+        assert "Valid: local, openai, google, minimax, voyage" in result["error"]
+
+    def test_missing_env_vars_return_structured_error(self, tmp_path, monkeypatch):
+        (tmp_path / ".code-review-graph").mkdir()
+        for var in ("CRG_OPENAI_API_KEY", "CRG_OPENAI_BASE_URL", "CRG_OPENAI_MODEL"):
+            monkeypatch.delenv(var, raising=False)
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="openai",
+        )
+        assert result["status"] == "error"
+        assert "CRG_OPENAI_API_KEY" in result["error"]
+
+    def test_store_closed_when_provider_unknown(self, tmp_path, monkeypatch):
+        (tmp_path / ".code-review-graph").mkdir()
+        store = MagicMock()
+        monkeypatch.setattr(
+            docs_module, "_get_store", lambda repo_root=None: (store, tmp_path),
+        )
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="moonbase",
+        )
+        assert result["status"] == "error"
+        store.close.assert_called_once()
+
+
+_ANALYSIS_TOOL_CASES = [
+    ("get_hub_nodes_func", "find_hub_nodes", []),
+    ("get_bridge_nodes_func", "find_bridge_nodes", []),
+    (
+        "get_knowledge_gaps_func",
+        "find_knowledge_gaps",
+        {
+            "isolated_nodes": [],
+            "thin_communities": [],
+            "untested_hotspots": [],
+            "single_file_communities": [],
+        },
+    ),
+    ("get_surprising_connections_func", "find_surprising_connections", []),
+    ("get_suggested_questions_func", "generate_suggested_questions", []),
+]
+
+
+class TestAnalysisToolsCloseStore:
+    """Regression tests: the 5 analysis tools leaked their GraphStore
+    (no try/finally), leaving graph.db file descriptors open."""
+
+    @pytest.mark.parametrize(
+        "func_name,analysis_name,ret", _ANALYSIS_TOOL_CASES,
+    )
+    def test_store_closed_on_success(
+        self, monkeypatch, tmp_path, func_name, analysis_name, ret,
+    ):
+        store = MagicMock()
+        monkeypatch.setattr(
+            analysis_module, "_get_store",
+            lambda repo_root=None: (store, tmp_path),
+        )
+        monkeypatch.setattr(
+            analysis_module, analysis_name, lambda *a, **k: ret,
+        )
+        result = getattr(analysis_module, func_name)()
+        assert "next_tool_suggestions" in result
+        store.close.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "func_name,analysis_name,_ret", _ANALYSIS_TOOL_CASES,
+    )
+    def test_store_closed_when_analysis_raises(
+        self, monkeypatch, tmp_path, func_name, analysis_name, _ret,
+    ):
+        store = MagicMock()
+        monkeypatch.setattr(
+            analysis_module, "_get_store",
+            lambda repo_root=None: (store, tmp_path),
+        )
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(analysis_module, analysis_name, boom)
+        with pytest.raises(RuntimeError, match="boom"):
+            getattr(analysis_module, func_name)()
+        store.close.assert_called_once()
+
+
+class TestGetWikiPageNoStoreLeak:
+    """Regression test: get_wiki_page_func opened a GraphStore just to
+    resolve the repo root and discarded it without closing."""
+
+    def test_get_wiki_page_does_not_open_graph_store(self, tmp_path, monkeypatch):
+        (tmp_path / ".code-review-graph").mkdir()
+        store_cls = MagicMock()
+        monkeypatch.setattr(common_module, "GraphStore", store_cls)
+        result = docs_module.get_wiki_page_func(
+            "anything", repo_root=str(tmp_path),
+        )
+        assert result["status"] == "not_found"
+        store_cls.assert_not_called()
+
+
 class TestFindLargeFunctions:
     """Tests for find_large_functions via direct store access."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         # Create functions of various sizes
         self.store.upsert_node(NodeInfo(
@@ -600,8 +1119,8 @@ class TestFlowTools:
         ))
 
         # CALLS edges: handle_request -> check_auth -> query_db
-        app_py = str(self.root / "app.py")
-        auth_py = str(self.root / "auth.py")
+        app_py = (self.root / "app.py").as_posix()
+        auth_py = (self.root / "auth.py").as_posix()
         self.store.upsert_edge(EdgeInfo(
             kind="CALLS",
             source=f"{app_py}::handle_request",
@@ -611,7 +1130,7 @@ class TestFlowTools:
         self.store.upsert_edge(EdgeInfo(
             kind="CALLS",
             source=f"{auth_py}::check_auth",
-            target=f"{str(self.root / 'db.py')}::query_db",
+            target=f"{(self.root / 'db.py').as_posix()}::query_db",
             file_path=auth_py, line=10,
         ))
         self.store.commit()
@@ -747,6 +1266,44 @@ class TestFlowTools:
         assert "flow(s) affected" in result["summary"]
         assert "changed_files" in result
 
+    def test_get_affected_flows_minimal_drops_steps(self):
+        """detail_level="minimal" strips per-flow step details (#849)."""
+        result = get_affected_flows_func(
+            changed_files=["auth.py"],
+            repo_root=str(self.root),
+            detail_level="minimal",
+        )
+        assert result["status"] == "ok"
+        assert result["total"] >= 1
+        for flow in result["affected_flows"]:
+            assert "steps" not in flow
+            assert "path" not in flow
+            assert "name" in flow
+            assert "criticality" in flow
+
+    def test_get_affected_flows_max_flows_truncates(self):
+        """max_flows bounds the list while total keeps the full count (#849)."""
+        result = get_affected_flows_func(
+            changed_files=["auth.py"],
+            repo_root=str(self.root),
+            max_flows=1,
+        )
+        assert result["status"] == "ok"
+        assert len(result["affected_flows"]) <= 1
+        if result["total"] > 1:
+            assert result["truncated"] is True
+            assert "showing 1" in result["summary"]
+
+    def test_get_affected_flows_max_flows_zero_disables_limit(self):
+        result = get_affected_flows_func(
+            changed_files=["auth.py"],
+            repo_root=str(self.root),
+            max_flows=0,
+        )
+        assert result["status"] == "ok"
+        assert result["truncated"] is False
+        assert len(result["affected_flows"]) == result["total"]
+
 
 class TestCommunityTools:
     """Tests for community-related MCP tool functions."""
@@ -773,7 +1330,7 @@ class TestCommunityTools:
     def _seed_data(self):
         """Seed the store with two clusters of related nodes."""
         # Cluster 1: auth module
-        auth_py = str(self.root / "auth.py")
+        auth_py = (self.root / "auth.py").as_posix()
         self.store.upsert_node(NodeInfo(
             kind="File", name="auth.py",
             file_path=auth_py,
@@ -798,7 +1355,7 @@ class TestCommunityTools:
         ))
 
         # Cluster 2: db module
-        db_py = str(self.root / "db.py")
+        db_py = (self.root / "db.py").as_posix()
         self.store.upsert_node(NodeInfo(
             kind="File", name="db.py",
             file_path=db_py,
@@ -1039,7 +1596,7 @@ class TestBuildPostprocess:
         assert "communities_detected" not in result
         assert "fts_indexed" not in result
 
-    def test_postprocess_minimal_has_fts_no_flows(self):
+    def test_postprocess_minimal_has_fts_no_flows(self, capsys):
         from unittest.mock import patch
 
         from code_review_graph.tools.build import build_or_update_graph
@@ -1057,8 +1614,15 @@ class TestBuildPostprocess:
         assert result.get("signatures_updated") is True
         assert "flows_detected" not in result
         assert "communities_detected" not in result
+        timing = result["postprocess_timing"]
+        assert set(timing) == {"signatures_s", "fts_s"}
+        assert all(
+            isinstance(value, float) and value >= 0
+            for value in timing.values()
+        )
+        assert capsys.readouterr().out == ""
 
-    def test_postprocess_full_matches_default(self):
+    def test_postprocess_full_matches_default(self, capsys):
         from unittest.mock import patch
 
         from code_review_graph.tools.build import build_or_update_graph
@@ -1076,6 +1640,118 @@ class TestBuildPostprocess:
         # Full postprocess should have flows and communities
         assert "flows_detected" in result
         assert "communities_detected" in result
+        timing = result["postprocess_timing"]
+        assert set(timing) == {
+            "signatures_s",
+            "fts_s",
+            "flows_s",
+            "communities_s",
+            "summaries_s",
+        }
+        assert all(
+            isinstance(value, float) and value >= 0
+            for value in timing.values()
+        )
+        assert capsys.readouterr().out == ""
+
+
+class TestBuildPostprocessResolvesBareEndpoints:
+    """Every explicit build/postprocess path applies safe endpoint resolution."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+        self.store = GraphStore(self.db_path)
+        app_file = "/repo/src/app.py"
+        test_file = "/repo/tests/test_app.py"
+        self.store.upsert_node(NodeInfo(
+            kind="Function",
+            name="parse",
+            file_path=app_file,
+            line_start=1,
+            line_end=5,
+            language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Test",
+            name="test_parse",
+            file_path=test_file,
+            line_start=1,
+            line_end=5,
+            language="python",
+            is_test=True,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="IMPORTS_FROM",
+            source=test_file,
+            target=app_file,
+            file_path=test_file,
+            line=1,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY",
+            source="parse",
+            target=f"{test_file}::test_parse",
+            file_path=test_file,
+            line=2,
+        ))
+        self.store.commit()
+
+    def teardown_method(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.db_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _tested_by_source(store: GraphStore) -> str:
+        row = store._conn.execute(
+            "SELECT source_qualified FROM edges WHERE kind = 'TESTED_BY'"
+        ).fetchone()
+        return row["source_qualified"]
+
+    def test_minimal_build_postprocess_resolves(self):
+        from code_review_graph.tools.build import _run_postprocess
+
+        result: dict = {}
+        warnings = _run_postprocess(self.store, result, "minimal")
+
+        assert warnings == []
+        assert result["bare_edges_resolved"] == 1
+        assert self._tested_by_source(self.store) == "/repo/src/app.py::parse"
+
+    def test_none_build_postprocess_skips_resolution(self):
+        from code_review_graph.tools.build import _run_postprocess
+
+        result: dict = {}
+        _run_postprocess(self.store, result, "none")
+
+        assert "bare_edges_resolved" not in result
+        assert self._tested_by_source(self.store) == "parse"
+
+    def test_manual_run_postprocess_resolves(self, monkeypatch):
+        import code_review_graph.tools.build as build_module
+
+        monkeypatch.setattr(
+            build_module,
+            "_get_store",
+            lambda _repo_root: (self.store, Path("/repo")),
+        )
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root="/repo",
+        )
+
+        assert result["bare_edges_resolved"] == 1
+        reopened = GraphStore(self.db_path)
+        try:
+            assert self._tested_by_source(reopened) == "/repo/src/app.py::parse"
+        finally:
+            reopened.close()
 
 
 class TestComputeSummaries:
@@ -1086,6 +1762,7 @@ class TestComputeSummaries:
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         self._seed_graph()
 
@@ -1413,6 +2090,108 @@ class TestGetMinimalContext:
         assert "summary" in result
         assert "next_tool_suggestions" in result
 
+    def test_missing_graph_returns_not_ready_without_creating_database(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        # Linked worktrees use a .git pointer file instead of a directory.
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+        db_path = repo / ".code-review-graph" / "graph.db"
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+        assert not db_path.exists()
+        assert not db_path.parent.exists()
+
+    def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        from code_review_graph.main import get_minimal_context_tool
+
+        repo = tmp_path / "cold-worktree"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+
+        result = get_minimal_context_tool(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not (repo / ".code-review-graph").exists()
+
+    def test_missing_graph_does_not_create_external_data_dir(self, tmp_path, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "external-data"
+        monkeypatch.setenv("CRG_DATA_DIR", str(external_data))
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_missing_registered_graph_does_not_create_registered_data_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        external_data = tmp_path / "registered-data"
+        registry_path = tmp_path / "registry" / "registry.json"
+        registry_path.parent.mkdir()
+        registry_path.write_text(json.dumps({
+            "repos": [{"path": str(repo.resolve()), "data_dir": str(external_data)}],
+        }))
+        monkeypatch.setenv("CRG_HOME", str(registry_path.parent))
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "missing_graph"
+        assert not external_data.exists()
+
+    def test_empty_graph_returns_not_ready(self, tmp_path):
+        from code_review_graph.tools.context import get_minimal_context
+
+        repo = tmp_path / "empty-graph"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        graph_dir = repo / ".code-review-graph"
+        graph_dir.mkdir()
+        store = GraphStore(graph_dir / "graph.db")
+        store.close()
+
+        result = get_minimal_context(repo_root=str(repo))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "empty_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
+    def test_graph_built_at_another_commit_returns_not_ready(self, monkeypatch):
+        from code_review_graph.tools.context import get_minimal_context
+
+        db_path = self.root / ".code-review-graph" / "graph.db"
+        store = GraphStore(db_path)
+        store.set_metadata("git_head_sha", "built-sha")
+        store.commit()
+        store.close()
+        monkeypatch.setattr(common_module, "_read_live_git_head", lambda _root: "live-sha")
+
+        result = get_minimal_context(repo_root=str(self.root))
+
+        assert result["status"] == "not_ready"
+        assert result["reason"] == "stale_graph"
+        assert result["next_tool_suggestions"] == ["build_or_update_graph"]
+
     def test_output_is_compact(self):
         import json
 
@@ -1447,3 +2226,256 @@ class TestGetMinimalContext:
             task="refactor auth module", repo_root=str(self.root),
         )
         assert "refactor" in result["next_tool_suggestions"]
+
+
+class TestGraphProvenance:
+    """Freshness metadata attached to single-repository graph responses."""
+
+    @staticmethod
+    def _make_repo(tmp_path, metadata=None, name="repo"):
+        repo = tmp_path / name
+        repo.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        graph_dir = repo / ".code-review-graph"
+        graph_dir.mkdir()
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="handle", file_path="src/app.py",
+                line_start=1, line_end=3, language="python",
+            ))
+            for key, value in (metadata or {}).items():
+                store.set_metadata(key, value)
+            store.commit()
+        finally:
+            store.close()
+        return repo
+
+    def test_reads_all_metadata_via_read_only_sqlite_uri(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = self._make_repo(tmp_path, {
+            "last_updated": "2000-01-02T03:04:05",
+            "git_branch": "feature/x",
+            "git_head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        })
+        real_connect = common_module.sqlite3.connect
+        connection_args = {}
+
+        def recording_connect(database, *args, **kwargs):
+            connection_args.update(database=database, uri=kwargs.get("uri"))
+            return real_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(common_module.sqlite3, "connect", recording_connect)
+        provenance = common_module.graph_provenance(str(repo))
+
+        assert provenance["updated_at"] == "2000-01-02T03:04:05"
+        assert provenance["built_on_branch"] == "feature/x"
+        assert provenance["built_at_sha"] == (
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        )
+        assert provenance["age_seconds"] > 0
+        assert connection_args["database"].endswith("?mode=ro")
+        assert connection_args["uri"] is True
+
+    def test_exclusive_lock_fails_soft_promptly(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"},
+        )
+        db_path = repo / ".code-review-graph" / "graph.db"
+        locker = common_module.sqlite3.connect(db_path)
+        try:
+            # GraphStore uses WAL, where writers do not block readers. Switch
+            # this fixture to rollback journalling so BEGIN EXCLUSIVE models a
+            # build or migration holding a database-wide lock.
+            journal_mode = locker.execute(
+                "PRAGMA journal_mode=DELETE",
+            ).fetchone()[0]
+            assert journal_mode == "delete"
+            locker.execute("BEGIN EXCLUSIVE")
+
+            started = time.monotonic()
+            provenance = common_module.graph_provenance(str(repo))
+            elapsed = time.monotonic() - started
+        finally:
+            locker.rollback()
+            locker.close()
+
+        assert provenance is None
+        assert elapsed < 1.0
+
+    @pytest.mark.parametrize("repo_name", [
+        "repo %40 #fragment",
+        "repo [windows-like] %23 #hash",
+    ])
+    def test_reads_metadata_from_uri_significant_paths(self, tmp_path, repo_name):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"}, repo_name,
+        )
+        provenance = common_module.graph_provenance(str(repo))
+        assert provenance["updated_at"] == "2000-01-02T03:04:05"
+
+    @pytest.mark.skipif(os.name != "nt", reason="native Windows path semantics")
+    def test_reads_metadata_from_native_windows_path(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"},
+            "repo %23 #windows",
+        )
+        assert "\\" in str(repo)
+        provenance = common_module.graph_provenance(str(repo))
+        assert provenance["updated_at"] == "2000-01-02T03:04:05"
+
+    def test_timezone_aware_timestamp_keeps_metadata_and_age(self, tmp_path):
+        repo = self._make_repo(tmp_path, {
+            "last_updated": "2000-01-02T03:04:05+05:30",
+            "git_branch": "feature/timezone",
+            "git_head_sha": "deadbeef",
+        })
+        provenance = common_module.graph_provenance(str(repo))
+
+        assert provenance["updated_at"] == "2000-01-02T03:04:05+05:30"
+        assert provenance["built_on_branch"] == "feature/timezone"
+        assert provenance["built_at_sha"] == "deadbeef"
+        assert provenance["age_seconds"] > 0
+
+    def test_timezone_aware_future_timestamp_clamps_age(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2999-01-01T00:00:00-07:00"},
+        )
+        assert common_module.graph_provenance(str(repo))["age_seconds"] == 0
+
+    def test_malformed_timestamp_omits_only_age(self, tmp_path):
+        repo = self._make_repo(tmp_path, {
+            "last_updated": "not-a-date",
+            "git_branch": "feature/malformed-time",
+            "git_head_sha": "cafebabe",
+        })
+        assert common_module.graph_provenance(str(repo)) == {
+            "updated_at": "not-a-date",
+            "built_on_branch": "feature/malformed-time",
+            "built_at_sha": "cafebabe",
+        }
+
+    def test_naive_future_timestamp_clamps_age(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2999-01-01T00:00:00"},
+        )
+        assert common_module.graph_provenance(str(repo))["age_seconds"] == 0
+
+    def test_branch_and_sha_are_optional(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"},
+        )
+        provenance = common_module.graph_provenance(str(repo))
+        assert "built_on_branch" not in provenance
+        assert "built_at_sha" not in provenance
+
+    def test_missing_last_updated_has_no_envelope(self, tmp_path):
+        repo = self._make_repo(tmp_path, {"git_branch": "main"})
+        assert common_module.graph_provenance(str(repo)) is None
+
+    def test_missing_graph_database_has_no_envelope(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        assert common_module.graph_provenance(str(repo)) is None
+        assert not (repo / ".code-review-graph").exists()
+
+    def test_corrupt_graph_database_has_no_envelope(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        graph_dir = repo / ".code-review-graph"
+        graph_dir.mkdir()
+        (graph_dir / "graph.db").write_bytes(b"not a sqlite database")
+        assert common_module.graph_provenance(str(repo)) is None
+
+    def test_invalid_repo_root_has_no_envelope(self, tmp_path):
+        assert common_module.graph_provenance(str(tmp_path / "missing")) is None
+
+    def test_with_provenance_preserves_response_fields(self, tmp_path):
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"},
+        )
+        response = {"status": "ok", "results": [{"name": "handle"}]}
+        result = common_module.with_provenance(response, str(repo))
+        assert result is response
+        assert result["status"] == "ok"
+        assert result["results"] == [{"name": "handle"}]
+        assert result["_graph"]["updated_at"] == "2000-01-02T03:04:05"
+
+    def test_with_provenance_handles_noop_cases(self, tmp_path):
+        repo_without_metadata = self._make_repo(tmp_path, name="empty")
+        response = {"status": "ok"}
+        assert common_module.with_provenance(
+            response, str(repo_without_metadata),
+        ) == response
+
+        repo = self._make_repo(
+            tmp_path, {"last_updated": "2000-01-02T03:04:05"}, "full",
+        )
+        assert common_module.with_provenance([1, 2], str(repo)) == [1, 2]
+        assert common_module.with_provenance(None, str(repo)) is None
+        existing = {"_graph": {"updated_at": "existing"}}
+        assert common_module.with_provenance(existing, str(repo)) is existing
+        assert existing["_graph"] == {"updated_at": "existing"}
+
+    def test_registered_sync_tool_preserves_existing_fields(self, tmp_path):
+        from code_review_graph.main import list_graph_stats_tool
+
+        repo = self._make_repo(tmp_path, {
+            "last_updated": "2000-01-02T03:04:05",
+            "git_branch": "main",
+        })
+        expected = list_graph_stats(repo_root=str(repo))
+        underlying = getattr(list_graph_stats_tool, "fn", None) or list_graph_stats_tool
+        result = underlying(repo_root=str(repo))
+
+        envelope = result.pop("_graph")
+        assert result == expected
+        assert envelope["updated_at"] == "2000-01-02T03:04:05"
+        assert envelope["built_on_branch"] == "main"
+
+
+def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
+    """The public tool adds scores without changing the stored node schema."""
+    store = GraphStore(tmp_path / "impact.db")
+    seed = "/seed.py::seed"
+    caller = "/caller.py::caller"
+    importer = "/importer.py::importer"
+    for name, path in (
+        ("seed", "/seed.py"),
+        ("caller", "/caller.py"),
+        ("importer", "/importer.py"),
+    ):
+        store.upsert_node(NodeInfo(
+            kind="Function", name=name, file_path=path,
+            line_start=1, line_end=3, language="python",
+        ))
+    store.upsert_edge(EdgeInfo(
+        kind="CALLS", source=caller, target=seed,
+        file_path="/caller.py", line=1,
+    ))
+    store.upsert_edge(EdgeInfo(
+        kind="IMPORTS_FROM", source=importer, target=seed,
+        file_path="/importer.py", line=2,
+    ))
+    store.commit()
+
+    monkeypatch.setattr(
+        query_module, "_get_store", lambda _repo_root: (store, tmp_path),
+    )
+    monkeypatch.setattr(
+        query_module,
+        "_resolve_graph_file_paths",
+        lambda _store, _root, _files: ["/seed.py"],
+    )
+
+    result = query_module.get_impact_radius(
+        changed_files=["seed.py"], repo_root=str(tmp_path),
+    )
+
+    assert [node["name"] for node in result["impacted_nodes"]] == [
+        "caller", "importer",
+    ]
+    scores = [node["impact_score"] for node in result["impacted_nodes"]]
+    assert scores == sorted(scores, reverse=True)

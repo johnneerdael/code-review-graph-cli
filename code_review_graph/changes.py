@@ -16,8 +16,20 @@ from typing import Any
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
+from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
+
+
+# Lifecycle and construction methods are exercised implicitly by every test
+# that touches their class, so listing them as test gaps is noise that
+# inflates the gap count and the Untested summary (#850). Names cover
+# PHPUnit/xUnit and Python unittest conventions.
+_TEST_GAP_EXEMPT_NAMES = frozenset({
+    "setUp", "tearDown", "setUpBeforeClass", "tearDownAfterClass",
+    "setup_method", "teardown_method", "setUpClass", "tearDownClass",
+    "__construct", "__init__", "__destruct",
+})
 
 _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
 
@@ -167,7 +179,100 @@ def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. map_changes_to_nodes
+# 2. compute_file_churn
+# ---------------------------------------------------------------------------
+
+_CHURN_SATURATION = 10.0
+_CHURN_WEIGHT = 0.15
+_NUMSTAT_COUNT = re.compile(r"^(?:\d+|-)$")
+
+
+def _parse_numstat(log_text: str) -> dict[str, int]:
+    """Parse NUL-terminated ``git log --numstat -z`` records.
+
+    NUL termination is required for correctness: Git's default line format
+    quotes unusual paths, while ``-z`` preserves tabs and newlines in file
+    names without making the graph-path lookup ambiguous.
+    """
+    counts: dict[str, int] = {}
+    for record in log_text.split("\0"):
+        if not record:
+            continue
+        fields = record.split("\t", 2)
+        if len(fields) != 3:
+            continue
+        added, deleted, path = fields
+        if (
+            not path
+            or _NUMSTAT_COUNT.fullmatch(added) is None
+            or _NUMSTAT_COUNT.fullmatch(deleted) is None
+        ):
+            continue
+        counts[path] = counts.get(path, 0) + 1
+    return counts
+
+
+def compute_file_churn(
+    repo_root: str,
+    window_days: int | None = None,
+) -> dict[str, int]:
+    """Count commits touching each file over a trailing window.
+
+    Returns an empty mapping when the window is invalid or Git cannot be
+    queried. Renames are deliberately not followed: churn belongs to the path
+    that existed in each commit.
+    """
+    if window_days is None:
+        raw_window = os.environ.get("CRG_CHURN_WINDOW_DAYS", "90")
+        try:
+            window_days = int(raw_window)
+        except ValueError:
+            logger.warning(
+                "Invalid CRG_CHURN_WINDOW_DAYS value %r; churn disabled",
+                raw_window,
+            )
+            return {}
+    if window_days <= 0:
+        return {}
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.quotepath=off",
+                "log",
+                f"--since={window_days}.days.ago",
+                "--numstat",
+                "--no-renames",
+                "--format=",
+                "-z",
+                "--",
+            ],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_GIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "git log failed (rc=%d): %s",
+                result.returncode,
+                result.stderr[:200],
+            )
+            return {}
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("git log error: %s", exc)
+        return {}
+
+    return _parse_numstat(result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 3. map_changes_to_nodes
 # ---------------------------------------------------------------------------
 
 
@@ -212,11 +317,15 @@ def map_changes_to_nodes(
 
 
 # ---------------------------------------------------------------------------
-# 3. compute_risk_score
+# 4. compute_risk_score
 # ---------------------------------------------------------------------------
 
 
-def compute_risk_score(store: GraphStore, node: GraphNode) -> float:
+def compute_risk_score(
+    store: GraphStore,
+    node: GraphNode,
+    churn_counts: dict[str, int] | None = None,
+) -> float:
     """Compute a risk score (0.0 - 1.0) for a single node.
 
     Scoring factors:
@@ -225,6 +334,8 @@ def compute_risk_score(store: GraphStore, node: GraphNode) -> float:
       - Test coverage: 0.30 (untested) scaling down to 0.05 (5+ TESTED_BY edges)
       - Security sensitivity: 0.20 if name matches security keywords
       - Caller count: callers / 20, capped at 0.10
+      - Change frequency (opt-in): commits touching the file / 10, capped
+        at 0.15
     """
     score = 0.0
 
@@ -266,11 +377,16 @@ def compute_risk_score(store: GraphStore, node: GraphNode) -> float:
     caller_count = len(caller_edges)
     score += min(caller_count / 20.0, 0.10)
 
+    # --- Change frequency (opt-in, cap 0.15) ---
+    if churn_counts and node.file_path:
+        commit_count = churn_counts.get(node.file_path, 0)
+        score += min(commit_count / _CHURN_SATURATION, 1.0) * _CHURN_WEIGHT
+
     return round(min(max(score, 0.0), 1.0), 4)
 
 
 # ---------------------------------------------------------------------------
-# 4. analyze_changes
+# 5. analyze_changes
 # ---------------------------------------------------------------------------
 
 
@@ -280,6 +396,7 @@ def analyze_changes(
     changed_ranges: dict[str, list[tuple[int, int]]] | None = None,
     repo_root: str | None = None,
     base: str = "HEAD~1",
+    include_churn: bool = False,
 ) -> dict[str, Any]:
     """Analyze changes and produce risk-scored review guidance.
 
@@ -291,6 +408,9 @@ def analyze_changes(
             (Git or SVN).
         repo_root: Repository root (for git/svn diff).
         base: Git ref or SVN revision range to diff against.
+        include_churn: Add an opt-in change-frequency term to each node's
+            risk score. The trailing window defaults to 90 days and can be
+            configured with ``CRG_CHURN_WINDOW_DAYS``.
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
@@ -298,7 +418,31 @@ def analyze_changes(
     """
     # Compute changed ranges if not provided.
     if changed_ranges is None and repo_root is not None:
-        changed_ranges = parse_diff_ranges(repo_root, base)
+        # Diff keys are forward-slash paths relative to the repo root, but
+        # the graph stores absolute native paths. Remap so lookups work on
+        # Windows, where the LIKE-suffix fallback cannot bridge
+        # "src/app.py" to "C:\repo\src\app.py" (#528). Keys that are
+        # already absolute pass through pathlib joining unchanged. The
+        # explicit changed_ranges path (MCP) is untouched — tools/review.py
+        # remaps before calling, and remapping twice would corrupt keys.
+        root_path = Path(repo_root)
+        changed_ranges = {
+            normalize_file_path(root_path / key): ranges
+            for key, ranges in parse_diff_ranges(repo_root, base).items()
+        }
+
+    # The affected-flows lookup and the no-ranges fallback match
+    # changed_files against nodes.file_path, which stores absolute
+    # normalized paths. CLI callers pass repo-relative diff paths, so an
+    # exact IN (...) match finds no nodes and detect-changes reports
+    # "0 affected flow(s)" even when the MCP tool reports hundreds on the
+    # same input (#848). Remap the same way as changed_ranges keys;
+    # already-absolute inputs (MCP) pass through pathlib joining unchanged.
+    if repo_root is not None:
+        _root = Path(repo_root)
+        changed_files = [
+            normalize_file_path(_root / fp) for fp in changed_files
+        ]
 
     # Map changes to nodes.
     if changed_ranges:
@@ -309,10 +453,12 @@ def analyze_changes(
         for fp in changed_files:
             changed_nodes.extend(store.get_nodes_by_file(fp))
 
-    # Filter to functions/tests for risk scoring (skip File nodes).
+    # RTL declarations are stored as Function nodes for compatibility but
+    # are not callable/testable functions.
     changed_funcs = [
         n for n in changed_nodes
         if n.kind in ("Function", "Test", "Class")
+        and not n.extra.get("verilog_kind")
     ]
 
     # Cap to prevent O(N*M) query explosion on large PRs.
@@ -321,10 +467,18 @@ def analyze_changes(
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
 
+    churn_counts: dict[str, int] | None = None
+    if include_churn and repo_root is not None:
+        churn_counts = {}
+        root_path = Path(repo_root)
+        for key, count in compute_file_churn(repo_root).items():
+            churn_counts[key] = count
+            churn_counts[normalize_file_path(root_path / key)] = count
+
     # Compute per-node risk scores.
     node_risks: list[dict[str, Any]] = []
     for node in changed_funcs:
-        risk = compute_risk_score(store, node)
+        risk = compute_risk_score(store, node, churn_counts)
         node_risks.append({
             **node_to_dict(node),
             "risk_score": risk,
@@ -341,7 +495,12 @@ def analyze_changes(
     for node in changed_funcs:
         if node.is_test:
             continue
-        tested = store.get_edges_by_target(node.qualified_name)
+        if node.name in _TEST_GAP_EXEMPT_NAMES:
+            continue
+        # TESTED_BY edges are stored as source=production, target=test by the
+        # parser, so a changed production function finds its tests by source.
+        # See: #515
+        tested = store.get_edges_by_source(node.qualified_name)
         if not any(e.kind == "TESTED_BY" for e in tested):
             test_gaps.append({
                 "name": _sanitize_name(node.name),

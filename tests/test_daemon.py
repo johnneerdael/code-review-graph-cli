@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +14,7 @@ from code_review_graph.daemon import (
     DaemonConfig,
     WatchDaemon,
     WatchRepo,
+    _serialize_toml,
     add_repo_to_config,
     clear_pid,
     is_daemon_running,
@@ -39,18 +43,20 @@ def sample_config_file(tmp_path):
     (repo_b / ".git").mkdir()
 
     config = tmp_path / "watch.toml"
+    # as_posix() keeps hand-written TOML valid on Windows, where native
+    # backslash paths are invalid basic-string escapes.
     config.write_text(
         f"[daemon]\n"
         f'session_name = "test-session"\n'
-        f'log_dir = "{tmp_path / "logs"}"\n'
+        f'log_dir = "{(tmp_path / "logs").as_posix()}"\n'
         f"poll_interval = 5\n"
         f"\n"
         f"[[repos]]\n"
-        f'path = "{repo_a}"\n'
+        f'path = "{repo_a.as_posix()}"\n'
         f'alias = "alpha"\n'
         f"\n"
         f"[[repos]]\n"
-        f'path = "{repo_b}"\n'
+        f'path = "{repo_b.as_posix()}"\n'
         f'alias = "beta"\n',
         encoding="utf-8",
     )
@@ -95,7 +101,7 @@ class TestConfigParsing:
 
         config_file = tmp_path / "watch.toml"
         config_file.write_text(
-            f'[[repos]]\npath = "{repo}"\n',
+            f'[[repos]]\npath = "{repo.as_posix()}"\n',
             encoding="utf-8",
         )
         cfg = load_config(config_file)
@@ -124,8 +130,8 @@ class TestConfigParsing:
 
         config_file = tmp_path / "watch.toml"
         config_file.write_text(
-            f'[[repos]]\npath = "{repo_a}"\nalias = "dup"\n\n'
-            f'[[repos]]\npath = "{repo_b}"\nalias = "dup"\n',
+            f'[[repos]]\npath = "{repo_a.as_posix()}"\nalias = "dup"\n\n'
+            f'[[repos]]\npath = "{repo_b.as_posix()}"\nalias = "dup"\n',
             encoding="utf-8",
         )
         cfg = load_config(config_file)
@@ -139,7 +145,7 @@ class TestConfigParsing:
 
         config_file = tmp_path / "watch.toml"
         config_file.write_text(
-            f'[[repos]]\npath = "{bare}"\nalias = "bare"\n',
+            f'[[repos]]\npath = "{bare.as_posix()}"\nalias = "bare"\n',
             encoding="utf-8",
         )
         cfg = load_config(config_file)
@@ -167,6 +173,36 @@ class TestConfigParsing:
         assert len(loaded.repos) == 1
         assert loaded.repos[0].alias == "rt"
         assert loaded.repos[0].path == str(repo.resolve())
+
+    def test_serialize_toml_escapes_backslashes_and_quotes(self):
+        """Windows paths and quotes must survive serialize -> parse."""
+        from code_review_graph.daemon import tomllib
+
+        config = DaemonConfig(
+            session_name='quo"ted',
+            log_dir=Path(r"C:\Users\example\logs"),
+            poll_interval=2,
+            repos=[WatchRepo(path=r"C:\Users\example\repo", alias="win")],
+        )
+        parsed = tomllib.loads(_serialize_toml(config))
+        assert parsed["daemon"]["session_name"] == 'quo"ted'
+        assert parsed["daemon"]["log_dir"] == str(Path(r"C:\Users\example\logs"))
+        assert parsed["repos"][0]["path"] == r"C:\Users\example\repo"
+
+    def test_serialize_toml_escapes_control_characters(self):
+        """TOML-forbidden control characters must survive serialize -> parse."""
+        from code_review_graph.daemon import tomllib
+
+        weird = "line1\nline2\ttabbed\x01ctrl\x7fdel"
+        config = DaemonConfig(
+            session_name=weird,
+            log_dir=Path("logs"),
+            poll_interval=2,
+            repos=[WatchRepo(path="repo", alias="a\rb")],
+        )
+        parsed = tomllib.loads(_serialize_toml(config))
+        assert parsed["daemon"]["session_name"] == weird
+        assert parsed["repos"][0]["alias"] == "a\rb"
 
     def test_add_repo_to_config(self, tmp_path):
         """add_repo_to_config adds a repo and saves."""
@@ -266,6 +302,7 @@ class TestPIDManagement:
         clear_pid(pid_path)
         assert not pid_path.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill branch")
     @patch("os.kill")
     def test_is_daemon_running_alive(self, mock_kill, pid_path):
         """os.kill(pid, 0) succeeds — daemon is running."""
@@ -274,13 +311,191 @@ class TestPIDManagement:
         assert is_daemon_running(pid_path) is True
         mock_kill.assert_called_once_with(1234, 0)
 
-    @patch("os.kill", side_effect=ProcessLookupError)
-    def test_is_daemon_running_dead(self, mock_kill, pid_path):
-        """ProcessLookupError clears stale PID and returns False."""
+    @patch("code_review_graph.daemon.pid_alive", return_value=False)
+    def test_is_daemon_running_dead(self, mock_alive, pid_path):
+        """A dead PID clears the stale PID file and returns False.
+
+        pid_alive is patched at the module seam rather than os.kill: on
+        Windows the liveness check goes through OpenProcess, so an os.kill
+        mock is bypassed and the test would probe the runner's real PID
+        space, where small PIDs like 9999 are routinely reused (flaked in
+        CI). The os.kill mapping itself is covered by TestPidAlive.
+        """
         write_pid(9999, pid_path)
         assert is_daemon_running(pid_path) is False
         # Stale PID file should be cleaned up
         assert not pid_path.exists()
+        mock_alive.assert_called_once_with(9999)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill branch")
+    @patch("os.kill", side_effect=OSError(87, "The parameter is incorrect"))
+    def test_is_daemon_running_oserror_treated_as_not_alive(self, mock_kill, pid_path):
+        """Regression #511: a bare OSError must not propagate out.
+
+        On Windows ``os.kill(pid, 0)`` raises OSError(WinError 87) for alive
+        PIDs outside the caller's console group; the liveness helper must
+        swallow unexpected OSErrors instead of crashing ``daemon status``.
+        """
+        write_pid(4321, pid_path)
+        assert is_daemon_running(pid_path) is False
+        # Treated as not-alive — stale PID file cleaned up
+        assert not pid_path.exists()
+
+
+# ===========================================================================
+# pid_alive Tests (#511)
+# ===========================================================================
+
+
+class TestPidAlive:
+    def test_pid_alive_for_live_pid(self):
+        """The current process is always alive."""
+        from code_review_graph.daemon import pid_alive
+
+        assert pid_alive(os.getpid()) is True
+
+    def test_pid_alive_for_dead_pid(self):
+        """A reaped child process is reported dead."""
+        import subprocess
+
+        from code_review_graph.daemon import pid_alive
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=30)
+        assert pid_alive(proc.pid) is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill branch")
+    @patch("os.kill", side_effect=PermissionError)
+    def test_pid_alive_permission_error_means_alive(self, mock_kill):
+        """EPERM means the process exists but is owned by another user."""
+        from code_review_graph.daemon import pid_alive
+
+        assert pid_alive(12345) is True
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill branch")
+    @patch("os.kill", side_effect=OSError(87, "The parameter is incorrect"))
+    def test_pid_alive_unexpected_oserror_means_not_alive(self, mock_kill):
+        """Regression #511: unexpected OSError is not-alive-safe, no crash."""
+        from code_review_graph.daemon import pid_alive
+
+        assert pid_alive(12345) is False
+
+
+class _FakeKernel32:
+    """Drives the win32 liveness logic without a real kernel32."""
+
+    def __init__(self, handle=0, wait_result=0x102, last_error=0):
+        self._handle = handle
+        self._wait_result = wait_result
+        self._last_error = last_error
+        self.open_calls: list[tuple] = []
+        self.wait_calls: list[tuple] = []
+        self.closed: list = []
+
+    def OpenProcess(self, access, inherit, pid):  # noqa: N802 - Win32 name
+        self.open_calls.append((access, inherit, pid))
+        return self._handle
+
+    def WaitForSingleObject(self, handle, timeout_ms):  # noqa: N802
+        self.wait_calls.append((handle, timeout_ms))
+        return self._wait_result
+
+    def CloseHandle(self, handle):  # noqa: N802
+        self.closed.append(handle)
+        return 1
+
+    def GetLastError(self):  # noqa: N802
+        return self._last_error
+
+
+class TestPidAliveWindows:
+    """Unit tests for the factored win32 branch (runs on any platform)."""
+
+    def test_alive_when_wait_times_out(self):
+        """Valid handle + WAIT_TIMEOUT (0x102) means the process is alive."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=1234, wait_result=0x102)
+        assert _pid_alive_windows(4242, kernel32) is True
+        # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, no inherit, the pid
+        assert kernel32.open_calls == [(0x1000 | 0x00100000, False, 4242)]
+        assert kernel32.wait_calls == [(1234, 0)]
+        # The handle must always be closed
+        assert kernel32.closed == [1234]
+
+    def test_dead_when_handle_is_signaled(self):
+        """Valid handle + WAIT_OBJECT_0 (0x0) means the process exited."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=1234, wait_result=0x0)
+        assert _pid_alive_windows(4242, kernel32) is False
+        assert kernel32.closed == [1234]
+
+    def test_alive_when_wait_fails(self, caplog):
+        """WAIT_FAILED cannot prove death, and records the Win32 error."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=1234, wait_result=0xFFFFFFFF, last_error=6)
+        with caplog.at_level("DEBUG", logger="code_review_graph.daemon"):
+            assert _pid_alive_windows(4242, kernel32) is True
+        assert "WaitForSingleObject on PID 4242 failed (error 6)" in caplog.text
+        assert kernel32.closed == [1234]
+
+    def test_pid_alive_declares_win32_function_prototypes(self, monkeypatch):
+        """ctypes uses pointer-width HANDLEs and unsigned DWORD wait results."""
+        import ctypes
+        from ctypes import wintypes
+
+        from code_review_graph.daemon import pid_alive
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 1234
+        kernel32.WaitForSingleObject.return_value = 0x102
+        kernel32.CloseHandle.return_value = 1
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", MagicMock(return_value=kernel32), raising=False)
+        monkeypatch.setattr(ctypes, "get_last_error", MagicMock(return_value=0), raising=False)
+
+        assert pid_alive(4242) is True
+        assert kernel32.OpenProcess.argtypes == (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        assert kernel32.OpenProcess.restype is wintypes.HANDLE
+        assert kernel32.WaitForSingleObject.argtypes == (wintypes.HANDLE, wintypes.DWORD)
+        assert kernel32.WaitForSingleObject.restype is wintypes.DWORD
+        assert kernel32.CloseHandle.argtypes == (wintypes.HANDLE,)
+        assert kernel32.CloseHandle.restype is wintypes.BOOL
+
+    def test_alive_on_access_denied(self):
+        """NULL handle + ERROR_ACCESS_DENIED (5) means alive (other user)."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=0, last_error=5)
+        assert _pid_alive_windows(4242, kernel32) is True
+        # Nothing to close when OpenProcess failed
+        assert kernel32.closed == []
+
+    def test_dead_on_other_open_error(self):
+        """NULL handle + ERROR_INVALID_PARAMETER (87) means the PID is gone."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=0, last_error=87)
+        assert _pid_alive_windows(4242, kernel32) is False
+        assert kernel32.closed == []
+
+    def test_injected_get_last_error_wins(self):
+        """An explicit get_last_error callable overrides kernel32.GetLastError."""
+        from code_review_graph.daemon import _pid_alive_windows
+
+        kernel32 = _FakeKernel32(handle=0, last_error=87)
+        assert _pid_alive_windows(4242, kernel32, get_last_error=lambda: 5) is True
 
 
 # ===========================================================================
@@ -327,6 +542,24 @@ class TestWatchDaemon:
             "repo_b": repo_b,
             "config_file": config_file,
         }
+
+    def test_sigterm_handler_stops_daemon_and_exits(self, daemon_env):
+        daemon = daemon_env["daemon"]
+        handlers = {}
+
+        with (
+            patch(
+                "code_review_graph.daemon.signal.signal",
+                side_effect=lambda sig, handler: handlers.__setitem__(sig, handler),
+            ),
+            patch.object(daemon, "stop") as stop,
+        ):
+            daemon._setup_signal_handlers()
+            with pytest.raises(SystemExit) as exc_info:
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        assert exc_info.value.code == 0
+        stop.assert_called_once_with()
 
     @patch("code_review_graph.daemon.subprocess.Popen")
     @patch("code_review_graph.registry.Registry")
@@ -796,6 +1029,83 @@ class TestDaemonCLI:
 
         assert exc_info.value.code == 1
 
+    def test_handle_stop_windows_uses_sigterm_for_forced_stop(self):
+        """Windows falls back to SIGTERM when SIGKILL is unavailable."""
+        from code_review_graph.daemon_cli import _handle_stop
+
+        args = MagicMock()
+        pid = 4242
+        windows_signal = MagicMock(spec=["SIGTERM"])
+        windows_signal.SIGTERM = signal.SIGTERM
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=True),
+            patch("code_review_graph.daemon.read_pid", return_value=pid),
+            patch("code_review_graph.daemon.pid_alive", return_value=True) as mock_alive,
+            patch("code_review_graph.daemon.clear_pid") as mock_clear_pid,
+            patch("code_review_graph.daemon_cli.signal", windows_signal),
+            patch("code_review_graph.daemon_cli.os.kill") as mock_kill,
+            patch("code_review_graph.daemon_cli.time.sleep"),
+        ):
+            _handle_stop(args)
+
+        assert [entry.args for entry in mock_kill.call_args_list] == [
+            (pid, signal.SIGTERM),
+            (pid, signal.SIGTERM),
+        ]
+        assert mock_alive.call_count == 50
+        mock_clear_pid.assert_called_once_with()
+
+    def test_handle_restart_windows_starts_after_process_exits(self):
+        """A Windows restart continues to start after the old process exits."""
+        from code_review_graph.daemon_cli import _handle_restart
+
+        args = MagicMock()
+        pid = 4242
+        windows_signal = MagicMock(spec=["SIGTERM"])
+        windows_signal.SIGTERM = signal.SIGTERM
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=True),
+            patch("code_review_graph.daemon.read_pid", return_value=pid),
+            patch("code_review_graph.daemon.pid_alive", return_value=False) as mock_alive,
+            patch("code_review_graph.daemon.clear_pid") as mock_clear_pid,
+            patch("code_review_graph.daemon_cli.signal", windows_signal),
+            patch("code_review_graph.daemon_cli.os.kill") as mock_kill,
+            patch("code_review_graph.daemon_cli.time.sleep") as mock_sleep,
+            patch("code_review_graph.daemon_cli._handle_start") as mock_start,
+        ):
+            _handle_restart(args)
+
+        mock_kill.assert_called_once_with(pid, signal.SIGTERM)
+        mock_alive.assert_called_once_with(pid)
+        mock_sleep.assert_not_called()
+        mock_clear_pid.assert_called_once_with()
+        mock_start.assert_called_once_with(args)
+
+    def test_handle_stop_clears_pid_if_forced_stop_fails(self):
+        """A failed forced stop must not leave a stale daemon PID file."""
+        from code_review_graph.daemon_cli import _handle_stop
+
+        args = MagicMock()
+        pid = 4242
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=True),
+            patch("code_review_graph.daemon.read_pid", return_value=pid),
+            patch("code_review_graph.daemon.pid_alive", return_value=True),
+            patch("code_review_graph.daemon.clear_pid") as mock_clear_pid,
+            patch(
+                "code_review_graph.daemon_cli.os.kill",
+                side_effect=[None, OSError("forced stop failed")],
+            ),
+            patch("code_review_graph.daemon_cli.time.sleep"),
+            pytest.raises(OSError, match="forced stop failed"),
+        ):
+            _handle_stop(args)
+
+        mock_clear_pid.assert_called_once_with()
+
     def test_handle_status_not_running(self):
         """_handle_status displays 'not running' when daemon is down."""
         from code_review_graph.daemon_cli import _handle_status
@@ -870,6 +1180,55 @@ class TestDaemonCLI:
             assert "alive" in printed
             assert "dead" not in printed
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX os.kill branch")
+    def test_handle_status_survives_oserror_from_liveness_check(self, tmp_path):
+        """Regression #511: 'daemon status' must not crash on OSError.
+
+        Before the fix, the child-liveness loop used bare ``os.kill(pid, 0)``
+        catching only ProcessLookupError/PermissionError, so the OSError
+        (WinError 87) Windows raises for alive PIDs crashed the command.
+        """
+        from code_review_graph.daemon_cli import _handle_status
+
+        repo = tmp_path / "my-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+
+        args = MagicMock()
+        cfg = DaemonConfig(
+            repos=[WatchRepo(path=str(repo), alias="myrepo")],
+            log_dir=tmp_path / "logs",
+        )
+        state = {"myrepo": {"pid": 4242, "path": str(repo)}}
+
+        with (
+            patch(
+                "code_review_graph.daemon.is_daemon_running",
+                return_value=True,
+            ),
+            patch(
+                "code_review_graph.daemon.load_config",
+                return_value=cfg,
+            ),
+            patch(
+                "code_review_graph.daemon.read_pid",
+                return_value=os.getpid(),
+            ),
+            patch(
+                "code_review_graph.daemon.load_state",
+                return_value=state,
+            ),
+            patch(
+                "os.kill",
+                side_effect=OSError(87, "The parameter is incorrect"),
+            ),
+            patch("builtins.print") as mock_print,
+        ):
+            _handle_status(args)  # must not raise
+            printed = " ".join(str(c) for c in mock_print.call_args_list)
+            # OSError is not-alive-safe on POSIX, so the child shows dead
+            assert "dead" in printed
+
     def test_handle_start_already_running(self):
         """_handle_start exits with error when daemon is already running."""
         from code_review_graph.daemon_cli import _handle_start
@@ -888,6 +1247,71 @@ class TestDaemonCLI:
             _handle_start(args)
 
         assert exc_info.value.code == 1
+
+    def test_handle_start_foreground_sets_lifecycle_before_children(self):
+        """Foreground mode owns a PID and handlers before spawning threads."""
+        from code_review_graph.daemon_cli import _handle_start
+
+        args = MagicMock(foreground=True)
+        daemon = MagicMock()
+        events: list[str] = []
+        daemon._setup_signal_handlers.side_effect = lambda: events.append("signals")
+        daemon.start.side_effect = lambda: events.append("start")
+        daemon.run_forever.side_effect = lambda: events.append("run")
+        daemon.stop.side_effect = lambda: events.append("stop")
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=False),
+            patch("code_review_graph.daemon.load_config", return_value=DaemonConfig()),
+            patch("code_review_graph.daemon.WatchDaemon", return_value=daemon),
+            patch(
+                "code_review_graph.daemon.write_pid",
+                side_effect=lambda: events.append("pid"),
+            ),
+        ):
+            _handle_start(args)
+
+        assert events == ["pid", "signals", "start", "run", "stop"]
+        daemon.daemonize.assert_not_called()
+
+    def test_handle_start_daemonizes_before_spawning_children(self):
+        """POSIX daemonization must happen before watcher/background threads."""
+        from code_review_graph.daemon_cli import _handle_start
+
+        args = MagicMock(foreground=False)
+        daemon = MagicMock()
+        events: list[str] = []
+        daemon.daemonize.side_effect = lambda: events.append("daemonize")
+        daemon.start.side_effect = lambda: events.append("start")
+        daemon.run_forever.side_effect = lambda: events.append("run")
+        daemon.stop.side_effect = lambda: events.append("stop")
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=False),
+            patch("code_review_graph.daemon.load_config", return_value=DaemonConfig()),
+            patch("code_review_graph.daemon.WatchDaemon", return_value=daemon),
+        ):
+            _handle_start(args)
+
+        assert events == ["daemonize", "start", "run", "stop"]
+
+    def test_handle_start_cleans_up_pid_when_startup_fails(self):
+        from code_review_graph.daemon_cli import _handle_start
+
+        args = MagicMock(foreground=True)
+        daemon = MagicMock()
+        daemon.start.side_effect = RuntimeError("watcher startup failed")
+
+        with (
+            patch("code_review_graph.daemon.is_daemon_running", return_value=False),
+            patch("code_review_graph.daemon.load_config", return_value=DaemonConfig()),
+            patch("code_review_graph.daemon.WatchDaemon", return_value=daemon),
+            patch("code_review_graph.daemon.write_pid"),
+            pytest.raises(RuntimeError, match="watcher startup failed"),
+        ):
+            _handle_start(args)
+
+        daemon.stop.assert_called_once_with()
 
     def test_handle_logs_missing_file(self, tmp_path):
         """_handle_logs exits when log file does not exist."""
@@ -940,3 +1364,74 @@ class TestDaemonCLI:
             assert mock_print.call_count == 3
             printed_lines = [str(c.args[0]) for c in mock_print.call_args_list]
             assert printed_lines == ["line3", "line4", "line5"]
+
+
+class TestPerUserStateLocation:
+    """Daemon state must follow $CRG_HOME, not a frozen Path.home()."""
+
+    def test_defaults_live_under_crg_home(self, tmp_path, monkeypatch):
+        from code_review_graph import daemon
+
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "state"))
+
+        assert daemon.default_config_path() == tmp_path / "state" / "watch.toml"
+        assert daemon.default_pid_path() == tmp_path / "state" / "daemon.pid"
+        assert daemon.default_state_path() == tmp_path / "state" / "daemon-state.json"
+        assert daemon.default_log_dir() == tmp_path / "state" / "logs"
+
+    def test_defaults_are_not_frozen_at_import(self, tmp_path, monkeypatch):
+        """The original bug: a module constant captured $HOME at import time.
+
+        The autouse conftest fixture sets CRG_HOME before any test runs, so a
+        constant would already hold the wrong value and no later override
+        could move it.
+        """
+        from code_review_graph import daemon
+
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "first"))
+        first = daemon.default_pid_path()
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "second"))
+
+        assert daemon.default_pid_path() != first
+        assert daemon.default_pid_path() == tmp_path / "second" / "daemon.pid"
+
+    def test_legacy_constant_names_still_resolve(self, tmp_path, monkeypatch):
+        """CONFIG_PATH/PID_PATH/STATE_PATH kept working via the PEP 562 shim."""
+        from code_review_graph import daemon
+
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "state"))
+
+        assert daemon.CONFIG_PATH == tmp_path / "state" / "watch.toml"
+        assert daemon.PID_PATH == tmp_path / "state" / "daemon.pid"
+        assert daemon.STATE_PATH == tmp_path / "state" / "daemon-state.json"
+
+    def test_unknown_attribute_still_raises(self):
+        from code_review_graph import daemon
+
+        with pytest.raises(AttributeError, match="no attribute 'NOPE'"):
+            _ = daemon.NOPE
+
+    def test_bare_daemon_config_logs_under_crg_home(self, tmp_path, monkeypatch):
+        """DaemonConfig()'s default_factory must not point at the real home."""
+        from code_review_graph.daemon import DaemonConfig
+
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "state"))
+
+        assert DaemonConfig().log_dir == tmp_path / "state" / "logs"
+
+    def test_legacy_names_are_visible_to_dir(self):
+        """__getattr__ alone leaves the names invisible to introspection."""
+        from code_review_graph import daemon
+
+        names = dir(daemon)
+        assert "CONFIG_PATH" in names
+        assert "PID_PATH" in names
+        assert "STATE_PATH" in names
+        # The real module globals are still there too.
+        assert "WatchDaemon" in names
+
+    def test_legacy_names_work_through_from_import(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path / "state"))
+        from code_review_graph.daemon import CONFIG_PATH
+
+        assert CONFIG_PATH == tmp_path / "state" / "watch.toml"

@@ -12,7 +12,9 @@
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do NOT open a public GitHub issue**
-2. Email the maintainer directly or use GitHub's private vulnerability reporting
+2. Use [GitHub private vulnerability reporting](https://github.com/tirth8205/code-review-graph/security/advisories/new)
+   — the "Report a vulnerability" button under the repository's **Security** tab. This is the
+   canonical reporting channel.
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
@@ -48,7 +50,7 @@ code-review-graph is a **local development tool**. It:
 
 - **Cloud embeddings**: Only when explicitly configured with OpenAI-compatible, Google Gemini, or MiniMax providers. Cloud providers emit an egress warning unless `CRG_ACCEPT_CLOUD_EMBEDDINGS=1` is set.
 - **Local embeddings model download**: One-time download from HuggingFace on first use of `sentence-transformers`
-- **D3.js CDN**: Visualization HTML loads D3.js v7 from `d3js.org` (with SRI verification)
+- **D3.js**: Visualization HTML loads a D3.js v7 copy bundled with the package (same-origin, SRI-verified); it only falls back to the `d3js.org` CDN (also SRI-verified, `crossorigin="anonymous"`) if the local copy is unavailable
 
 ## Security Scanning
 

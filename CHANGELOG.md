@@ -2,6 +2,380 @@
 
 ## [Unreleased]
 
+## [2.3.8] - 2026-08-21
+
+### Added
+
+- Empty results from `query_graph`, `get_impact_radius`, and
+  `semantic_search_nodes` now carry a one-sentence `confidence` field saying
+  *why* the count is zero: the target was never indexed, the graph is behind
+  the working tree, a known static-analysis gap applies to that language and
+  query (PHP container resolution and `include`/`require`, JS/TS callbacks and
+  route registration, npm-aliased imports, Java AOP and reflection, Go
+  structural interface satisfaction, C# DI, Python `getattr` and registry
+  decorators), or the zero is a verified real absence. The field is capped at
+  140 characters and is emitted **only** when the result list is empty, so
+  responses that carry results are byte-identical to before. One honest
+  sentence is far cheaper than the wrong conclusion or the repo-wide grep a
+  bare zero provokes (#314, #819, #850, #851).
+- Added a Voyage AI embedding provider (`--provider voyage`, key from
+  `VOYAGE_API_KEY`, opt-in request throttling via
+  `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
+  batch for every provider, so an interrupted cloud run keeps completed
+  batches and re-runs skip up-to-date nodes (#783).
+- Added `code-review-graph forget PATH [PATH ...]` to drop already-parsed files
+  from the graph without a full rebuild. Paths may be absolute, relative to the
+  repository root, a directory (every file underneath is dropped), or a glob
+  pattern, and `--dry-run` previews the selection. The result is equivalent to
+  rebuilding the graph without those files: surviving referrers are re-parsed so
+  no edge is left pointing at a deleted node, and flows, communities, the FTS
+  index, and embeddings are all repaired (#678).
+- Added `--platform NAME` to `code-review-graph uninstall` to unbind a single
+  platform's MCP registration while preserving the graph data and every other
+  configured integration. Without `--platform` the command still performs the
+  full uninstall (#678).
+
+### Fixed
+
+- Almost every MCP tool response is now bounded. #849 found `get_affected_flows`
+  returning roughly 247k tokens inside a workflow documented as "5 tool calls,
+  800 tokens total"; measuring all 30 registered tools against a real
+  5.6k-node graph found the same shape in ten more places, several of them on
+  the default path. Each list now carries a hard ceiling, keeps its
+  untruncated total, and reports "showing N of M" in the summary, so a caller
+  can tell a short answer from a truncated one. Four query tools are still
+  unbounded and tracked in #888 (#849, #853, #887).
+- A repository is now one graph however its root is spelled. Every
+  path-valued `--repo` is canonicalized at the CLI boundary, and the full
+  build, incremental update and watch entry points each resolve their root, so
+  `.`, a relative path, a trailing slash, a symlinked path and an absolute
+  path no longer split the graph or reconcile each other away. An incremental
+  run whose stored `File` nodes all belong to a different root is refused with
+  a clear error instead of emptying the graph file by file, while orphan-only
+  cleanup from #861 is unchanged (#889).
+- A repository reached through a symlinked path is watched and indexed instead
+  of silently dropping every filesystem event, both through
+  `code-review-graph watch --repo` and through `serve --auto-watch` (#892).
+- Watch mode no longer registers OS watches inside ignored trees, and no longer
+  keeps running after its filesystem observer dies. Watches are now planned per
+  directory (ignored trees are skipped, the repo root is watched
+  non-recursively, and directories that appear or disappear later are picked up
+  from a per-tick listing rather than from directory events, which macOS never
+  delivers for a child of a non-recursive watch), nested build output such as
+  `moduleA/target/` is ignored when a sibling `pom.xml` proves it is build
+  output — reported at info level and overridable per path with `!path` in
+  `.code-review-graphignore` — and a dead watchdog thread makes the watcher log
+  an error and exit non-zero so the daemon restarts it, while a deleted watch
+  root is merely released. `crg-daemon status` gained a `Watcher` column
+  (ok/partial/stalled/unknown/dead) and last-event age, and the daemon now backs
+  off exponentially between restarts of a watcher that keeps dying (#811).
+- Deleting and recreating a watched directory (`rm -rf src && mkdir src`, or two
+  branch switches in a row) no longer kills the watcher or silently drops the
+  recreated directory from the graph. Watches are tracked by inode rather than
+  by path, so a replacement is released and re-adopted instead of being read as
+  a dead watcher, and a directory adopted after startup is planned the same way
+  startup plans the repository — its own `node_modules` and `target` stay
+  unwatched (#811).
+- `code-review-graph watch --repo .` no longer empties the graph on startup. The
+  watcher resolves its repository root before reconciling, so stored absolute
+  paths are no longer all treated as stale, and a graph built under a genuinely
+  different root is now refused with a clear error instead of being reconciled
+  away file by file (#811).
+- The generated instruction sections no longer tell agents to always use the
+  graph before reading source and to fall back to file search only when the
+  graph misses. Every platform instruction file now carries the same short
+  guardrails: narrow scope with the graph, read the implementation and its
+  tests before a non-trivial change, prefer the source when the two disagree,
+  and treat an empty graph result as possibly unindexed rather than absent.
+  CONTRIBUTING.md also states what a new platform target must include before
+  it will be reviewed (#314).
+- Reinstalling now upgrades an instruction section written by an older release
+  instead of skipping the file because the opening marker was already there,
+  which is what made every wording fix invisible to existing users. Generated
+  sections carry a closing marker so the block has real boundaries; blocks from
+  before that marker existed are matched by their exact recorded text, so
+  anything written around them survives byte for byte. A section someone edited
+  by hand is left alone and named in the install output instead of being
+  overwritten, and `install` now reports created, updated and left-alone files
+  separately (#314, #558).
+- `uninstall` now removes an instruction section written by any past release,
+  not only one written by the running version, so asking for the instructions
+  to go no longer leaves orphaned text behind. It matches the same recorded
+  block texts install uses, clears duplicate blocks, keeps the text on both
+  sides of the block, closes the gap without leaving a run of blank lines, and
+  still refuses to touch a section that was edited by hand (#314).
+- C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
+  now resolve to canonical method nodes using receiver-type and namespace
+  evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and
+  `tests_for` return real results for C# codebases instead of bare unresolved
+  names (#612).
+- C# namespace-targeted `IMPORTS_FROM` edges now resolve in `get_impact_radius`,
+  `tests_for`, and the `detect_changes` test-gap classification, not just
+  `importers_of` — well-covered C# code is no longer reported as untested
+  (#310, #792).
+- The path alias resolver now reads `jsconfig.json` (with `tsconfig.json`
+  taking precedence), so plain-JS Vue/Nuxt/Vite projects resolve `@/...`
+  imports instead of silently dropping most of the import graph (#776).
+- Qualified names and `file_path` values now always use POSIX forward-slash
+  separators, making graphs separator-stable across operating systems and
+  fixing 15 Windows test failures; `GraphStore.get_node` bridges native-spelling
+  lookups. Graphs built on Windows by earlier versions need a rebuild (#774).
+- A file saved while it is being indexed no longer stays permanently
+  under-indexed: language detection and parsing now use the same byte snapshot
+  that produced the stored `file_hash` (#746).
+- `status` no longer reports stale or phantom languages: the language list is
+  derived from the live indexed-file inventory, and Java-specific resolvers
+  rerun when Java files leave the graph (#474).
+- `visualize` auto mode now also switches to an aggregated view when the
+  rendered edge count exceeds its budget (previously node-count-only, which
+  stalled the D3 force layout on edge-heavy graphs), and falls back to file
+  aggregation when no community data exists (#609).
+- `visualize --serve` now works on offline and filtered networks: the pinned
+  D3 build ships with the package and is loaded same-origin with its SRI hash
+  verified, keeping an SRI-pinned CDN fallback. Placeholder substitution is
+  ordered so repo-derived graph content can never be expanded as template
+  markup (#475).
+- Refreshed `uv.lock` within existing constraints, clearing all disclosed
+  advisories from #665 (mcp 1.29.0, python-multipart 0.0.32, authlib 1.7.2,
+  pyjwt 2.13.0, starlette 1.3.1, cryptography 49.0.0).
+- Swift initializers, deinitializers and subscripts now emit `Function` nodes
+  (#786). `init_declaration`, `deinit_declaration` and `subscript_declaration`
+  are node types distinct from `function_declaration`, so the walker skipped
+  them and attributed the calls in their bodies to the enclosing *File* node —
+  a change inside one initializer read as file-wide blast radius, and
+  `get_impact_radius` on a callee could not trace back to the initializer that
+  calls it. Each is named after its declaration keyword, since the grammar
+  gives none of the three a usable name field (`subscript`'s would be its
+  return type, `deinit`'s is absent).
+- GitHub Copilot auto-detection now requires the Copilot extension and also
+  recognizes the extension bundled with released VS Code installations.
+- C# methods with a non-generic return type are no longer named after that
+  type: `public async Task Foo()` indexed as `Task`, collapsing every such
+  method in a class onto one qualified name (#791).
+- Java method and constructor names now use the grammar `name` field (same
+  approach as C#), instead of walking for the first `identifier` child (#804).
+- Added a post-index Python import resolver using unique module suffixes, so
+  `src/` layouts produce canonical `CALLS` and `TESTED_BY` edges while duplicate
+  package candidates remain explicitly unresolved (#720).
+
+## [2.3.7] - 2026-07-18
+
+**Maintainer-reconciliation release.** This release packages the verified work
+merged since v2.3.6: broader language and framework coverage, safer graph and
+CLI workflows, platform-install hardening, daemon reliability, and the final
+CodeQL security fixes. The four client-validation drafts remain excluded. No
+breaking changes.
+
+### Added
+
+- Expanded CLI-first workflows with CommonJS `require()` parsing, ten focused
+  graph commands, quiet and JSON output, bounded enrichment, and dead-code
+  analysis (PRs #95, #340, and #341).
+- Added safe Java and Spring modeling for request endpoints, WebFlux routes,
+  value-redacted application configuration, scheduled triggers, application
+  events, Lombok constructor injection, runtime callbacks, and method
+  references (PRs #462, #577, #589, #590, and #591).
+- Added repository-bounded PHP/Laravel semantics and Julia qualified-scope
+  parsing, plus evidence-backed typed-member resolution, Python star-import
+  expansion, Python class decorators, and C# inheritance edges (PRs #628,
+  #638, #639, #643, #647, and #649).
+- Added bounded transitive test coverage, opt-in churn risk, weighted
+  impact-radius ranking, and graph provenance on MCP responses (PRs #636,
+  #640, #644, and #646).
+- Added CodeBuddy Code MCP configuration and project skills using its official
+  shared project contract (PR #633).
+- Added Terraform/OpenTofu structural parsing for resources, data sources,
+  modules, variables, outputs, locals, providers, and expression references.
+  References resolve across sibling files in a Terraform module, and local
+  module sources connect to parsed target files (PR #514; Terraform portion of
+  #199).
+- Added Ansible playbook, role, task, handler, notification, include, and role
+  dependency extraction with qualified graph relationships, duplicate-task
+  disambiguation, and ordinary-YAML false-positive guards (PR #415).
+- Added bounded VB.NET structural parsing for namespaces, types, generics,
+  multiline members, properties, calls, inheritance, and interfaces. Same-file
+  targets resolve case-insensitively only when scope evidence is unique, and
+  overloads share one stable graph symbol (replacing PR #517).
+- Expanded SystemVerilog structure with ports, nets, parameters, packages,
+  typedefs, modports, port references, and verification declarations. Function
+  locals are excluded rather than promoted to module globals, and signal nodes
+  no longer pollute function risk, flow, dead-code, or size analyses (PR #522).
+- Corrected Rust trait and `impl` identity, preserving one concrete type across
+  repeated implementation blocks. Nested/aliased `use` trees, `Self` and
+  turbofish calls, and bounded cached Cargo path/workspace dependency resolution
+  now retain their original graph targets (replacing PR #526).
+- Added an explicit local JSON visualization export. The output is written
+  atomically inside the ignored graph data directory and is documented as
+  potentially containing absolute paths and code-structure metadata (PR #449).
+- Functions and classes now retain a bounded, first-paragraph documentation
+  summary in backward-compatible node metadata across Python, JSDoc/Javadoc,
+  C# XML docs, Doxygen, Rust, and Go. Semantic embedding text includes the
+  normalized summary, so behavior-oriented queries no longer depend only on
+  identifier overlap (replacing PR #602, with Stefan Hudici attribution).
+- Explicit provider-and-model-scoped embedding refresh is available on build,
+  update, postprocess, and watch paths. It is default-off, refuses silent
+  provider/model/endpoint migration, remains fail-soft, and purges vectors for
+  deleted or renamed nodes; manual `embed` also purges orphans (replacing PR
+  #599, with Stefan Hudici attribution).
+- Added `code-review-graph uninstall` as a safe, symmetric counterpart to
+  `install` (#482, replacing PR #491). It derives MCP cleanup from the live
+  platform specifications, preserves unrelated shared configuration and JSONC
+  comments, commits shared-file edits with atomic replacement, removes only
+  CRG-owned hook/skill files, requires and normalizes Git/SVN repository roots,
+  enforces repository/home boundaries, and supports dry-run,
+  registered-repository, data-retention, and user-config-retention modes.
+
+### Fixed
+
+- Made minimal-context and review analysis non-blocking, shared changed-file
+  discovery across review tools, bounded automatic repository detection, and
+  cached graph access so MCP requests avoid repeated scans (PRs #394 and #457).
+- Corrected semantic-search mode reporting, skipped unavailable native grammar
+  parsers safely, and surfaced graph staleness, omitted counts, and symbol
+  disambiguation in responses (PRs #458, #459, and #538).
+- Hardened daemon startup and persistence: foreground lifecycle state is ready
+  before serving, generated TOML escapes strings, and Windows PID checks use
+  waitable handles without leaking temporary handles (PRs #630 and #632).
+- Preserved undecodable subprocess output, expanded trailing-slash ignores,
+  retained nested source directories, and excluded AWS CDK synth output without
+  hiding source trees (PRs #566, #583, and #635).
+- Reconciled community detection placement/splitting and restored responsive
+  visualization sizing without changing graph data (PRs #641 and #642).
+- Serialized first-use local embedding dependency imports and model construction
+  across MCP worker threads. POSIX startup remains lazy, failed loads are not
+  cached, and Windows retains its main-thread prewarm (#610, replacing PR #611).
+- PHP scoped/static calls now resolve during parsing when backed by same-file,
+  enclosing-class, import, qualified-name, or namespace evidence. This keeps
+  incremental work bounded to changed files and leaves unrelated globally
+  unique `Class::method` names unresolved (safe subset of PR #568).
+- Incremental Git change discovery now reads NUL-delimited byte output, so
+  Unicode, whitespace, newline, and literal arrow paths are preserved while
+  rename/copy records keep destination-only semantics (PR #618).
+- MCP stdio servers now use thread-based parallel parsing on every platform,
+  preventing inherited transport descriptors from keeping Unix servers and
+  workers alive after host disconnects, while normal non-interactive CLI/CI
+  builds retain the faster process-pool default (PR #615).
+- Bare CALLS targets and TESTED_BY sources are qualified during postprocessing
+  only when same-file or import evidence identifies exactly one node. Query-time
+  fallbacks apply the same rule, preventing unrelated same-named functions from
+  inheriting tests (replacing the unsound subset of PR #601).
+- Corrected TESTED_BY edge direction across graph, refactor, and transitive-test
+  consumers, with a parser-to-store-to-query regression (#527/#559/#598 class).
+- C# receiver calls now capture bare, chained, member, and null-conditional
+  invocations with caller attribution (#612); Kotlin/C# annotations and C#
+  namespace importer resolution—including nested namespaces—are also preserved
+  (#295/#310, PR #353).
+- Restored advertised Zig structure, calls, imports, and test nodes, including
+  TESTED_BY edges for test blocks embedded in ordinary source files (PR #393).
+- Hardened generated skills/configuration: uppercase `SKILL.md` (PR #563),
+  string-safe JSONC plus top-level and nested-container data-preservation guards
+  (#553, PR #354), and portable PATH-aware hooks (PR #565).
+- Packaged documentation remains reachable through the MCP wrapper (#613),
+  Action comments render repository-relative paths, and both visualization
+  templates select the graph SVG specifically (PR #564).
+- **PHP `use` imports now resolve to files** (`importers_of`, impact radius,
+  call disambiguation): PHP `use` statements had no branch in the parser's
+  import extraction and fell through to the raw-text fallback, storing the whole
+  `use ...;` statement as the `IMPORTS_FROM` edge target (e.g.
+  `"use App\Domain\Entity\Job;"`). As a result `importers_of` / `tests_for` /
+  `inheritors_of` and the upstream side of `get_impact_radius` returned nothing
+  for PHP classes, and the unresolved targets also degraded cross-file `CALLS`
+  disambiguation in `resolve_bare_call_targets`. PHP imports are now recorded as
+  fully-qualified names (handling `as` aliases, grouped `use A\{B, C}`, and
+  `use function` / `use const`) and resolved to absolute `.php` paths by walking
+  up from the importing file, mirroring the existing Java resolver. Vendor/global
+  classes with no local file stay as the bare FQN.
+
+### Changed
+
+- Updated supported async, embedding, watchdog, checkout, cache, and Python
+  setup dependencies while keeping the published compatibility bounds explicit
+  (PRs #544, #629, and #631).
+- Fork pull-request reviews now use a least-privilege two-stage workflow, and
+  evaluation configs use larger pinned commits for reproducible measurements
+  (PRs #468 and #634).
+- Build output now exposes post-processing stage timings for performance
+  diagnosis (PR #637).
+
+### Security
+
+- Closed all three open high-severity CodeQL alerts: the PyPI diagnostic now
+  uses the default secure TLS context, URL checks compare parsed hostnames, and
+  visualization tests use structural HTML parsing instead of unsafe regular
+  expressions (PR #657).
+
+## [2.3.6] - 2026-06-10
+
+**Community-response release.** Built from a full audit of every open PR,
+issue, and discussion: community fixes merged with credit, verified defects
+fixed (including two open Windows bugs), benchmark claims made independently
+checkable, and the project's first self-hosted PR review bot — this repo now
+reviews its own pull requests with its own graph. No breaking changes.
+
+### Added
+
+- **Custom languages without forking** (#320): drop a
+  `.code-review-graph/languages.toml` into your repo to index any grammar
+  shipped by tree-sitter-language-pack (extension map + node-type lists,
+  validated and capped, built-ins always win). See docs/CUSTOM_LANGUAGES.md.
+- **GitHub Action** for risk-scored PR review comments: composite `action.yml`
+  builds/restores the graph from CI cache, runs `detect-changes` against the
+  PR base, and upserts a sticky comment with risk table, affected flows, test
+  gaps, and the Token Savings line. Dogfooded on this repo via
+  `.github/workflows/pr-review.yml`. See docs/GITHUB_ACTION.md.
+- **`agent_baseline` eval benchmark**: compares graph queries against a
+  realistic grep-and-read-top-k agent baseline instead of the whole-corpus
+  strawman; wired into all six pinned eval configs.
+- **Co-change ground truth for `impact_accuracy`**: predictions are now also
+  graded against files actually co-changed in the same commit; the legacy
+  metric is explicitly labelled "graph-derived (circular — upper bound)".
+- **Weekly eval CI** (`.github/workflows/eval.yml`): report-only cron run of
+  the two smallest pinned configs with CSV artifacts and a job summary.
+- **docs/FAQ.md**: how CRG compares to LSP, RAG, grep/agentic search, and
+  adjacent tools; when NOT to use it; verification steps; monorepo/worktree
+  and registry guidance. Linked from the README.
+- GitHub issue forms (bug/feature/platform), a PR template mirroring the
+  CONTRIBUTING checklist, and dependabot config for pip + GitHub Actions.
+
+### Fixed
+
+- `store_file_batch` is now guarded against open transactions like its sibling
+  (#489, merged from community PR #529 by @Devilthelegend — thank you).
+- **Windows: `daemon status` no longer crashes with WinError 87** (#511):
+  PID liveness now uses `OpenProcess`/`WaitForSingleObject` on win32 instead
+  of `os.kill(pid, 0)`.
+- **Windows: CLI `detect-changes` mapped 0 functions** (#528): diff paths are
+  now remapped to absolute native paths before node lookup, matching the MCP
+  tool's behavior; also prevents the misleading "~100% token savings" line on
+  an empty result.
+- Eval benchmarks no longer record failed runs as inflated wins: thrown
+  `get_review_context`/`analyze_changes` calls are marked `status=error` and
+  excluded from aggregates instead of producing naive/1 ratios or recall=1.0.
+- Unknown embedding provider names now raise a clear error listing valid
+  providers instead of silently falling back to the local model.
+- The five analysis MCP tools and the wiki-page tool no longer leak SQLite
+  connections (try/finally `store.close()`).
+- `install` git hooks now resolve the real hooks directory via
+  `git rev-parse --git-path hooks`, so linked worktrees and `core.hooksPath`
+  (husky) setups get a working pre-commit hook (#313 residue).
+- Shipped `hooks/hooks.json` and `hooks/session-start.sh` now drain stdin,
+  matching the generated configs (#493 class).
+- `fastmcp` is now capped `<4` so the next major cannot silently break the
+  server (the #488 failure mode).
+
+### Changed
+
+- README benchmarks section now leads with the ~82x median per-question
+  reduction (528x presented as the best case, not the headline), the
+  limitations block is visible instead of collapsed, and "100% impact recall"
+  is reframed as a graph-derived upper bound alongside the new co-change
+  metric.
+- Stale translated READMEs (zh-CN, ja-JP, ko-KR, hi-IN) carry a staleness
+  banner; the zh-CN benchmark captions and docs/USAGE.md no longer contradict
+  the English README.
+- SECURITY.md now points to GitHub private vulnerability reporting as the
+  canonical channel.
+
 ## [2.3.5] - 2026-05-25
 
 **Real-time token savings, visible to humans.** The estimated context-savings
